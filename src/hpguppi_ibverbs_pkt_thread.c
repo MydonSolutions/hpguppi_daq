@@ -630,9 +630,10 @@ int debug_i=0, debug_j=0;
 
   // pktbuf_info related variables
   struct hpguppi_pktbuf_info * pktbuf_info = hpguppi_pktbuf_info_ptr(db);
-  uint32_t num_chunks = pktbuf_info->num_chunks;
-  struct hpguppi_pktbuf_chunk * chunks = pktbuf_info->chunks;
-  size_t slots_per_block = pktbuf_info->slots_per_block;
+  const size_t slot_size = pktbuf_info->slot_size;
+  const uint32_t num_chunks = pktbuf_info->num_chunks;
+  const struct hpguppi_pktbuf_chunk * chunks = pktbuf_info->chunks;
+  const size_t slots_per_block = pktbuf_info->slots_per_block;
 
   // The all important hashpipe_ibv_context
   struct hashpipe_ibv_context * hibv_ctx = hashpipe_ibv_context_ptr(db);
@@ -643,7 +644,7 @@ int debug_i=0, debug_j=0;
 
   // Misc counters, etc
   int i;
-  uint64_t base_addr;
+  uint64_t base_addr, sge_slot_index;
   int got_wc_error = 0;
 
   // We maintain two active blocks at all times.  curblk is the number of the
@@ -652,17 +653,24 @@ int debug_i=0, debug_j=0;
   // curblk as the destination.  Enough WRs are posted to cover up to the
   // entire first block or as many WRs as the NIC can have outstanding at ones,
   // whichever is less.  When packets are received, their WRs' SGEs are updated
-  // to point to the next free slot, which could be in the same block or the
-  // next block higher (with wrapping).  If any of these new SGEs point to a
-  // block that is greater than curblk+1, then block curblk is marked filled
-  // and curblk is incremented.  This continues indefinitely.
-  uint64_t curblk = 0;
+  // to point to the next free slot, which is in nxtblk. When the next free slot
+  // exceeds slots_per_block then the curblk block is set_as_filled, then curblk
+  // is set to nxtblk and finally nxtblk is incremented, modulo db->header.n_block. 
+  // This continues indefinitely.
+  int32_t curblk = -1;
+  uint32_t nxtblk = 0;
 
   // Used to track next block/slot to be assigned to a work request.
-  // next_slot is always within the range 0 to slots_per_block-1, but
-  // next_block is allowed to grow "forever".
-  uint64_t next_block = 0;
-  uint32_t next_slot = 0;
+  // next_slot is always within the range 0 to slots_per_block-1.
+  uint32_t next_slot = hibv_ctx->recv_pkt_num + 1;
+
+  // If the next_slot should be in the next block,
+  // increment nxtblk.
+  if(next_slot > slots_per_block) {
+    next_slot = 0;
+    curblk=nxtblk;
+    nxtblk++;
+  }
 
   // This ibv_flow pointer is used to support a diagnostic "sniffer" mode.
   // This is enabled by setting IBVSNIFF=1 in the status buffer.
@@ -677,20 +685,13 @@ int debug_i=0, debug_j=0;
   // Wait until the first two blocks are marked as free
   // (should already be free)
   for(i=0; i<2; i++) {
-    wait_for_block_free(db, (curblk+i) % N_INPUT_BLOCKS, st, status_key);
+    wait_for_block_free(db, i % db->header.n_block, st, status_key);
   }
 
   // Initialize IBV
   if(hpguppi_ibverbs_init(hibv_ctx, st, db)) {
     hashpipe_error(thread_name, "hpguppi_ibverbs_init failed");
     return NULL;
-  }
-
-  // Initialize next slot
-  next_slot = hibv_ctx->recv_pkt_num + 1;
-  if(next_slot > pktbuf_info->slots_per_block) {
-    next_slot = 0;
-    next_block++;
   }
 
   // Variables for counting packets and bytes as well as elapsed time
@@ -795,35 +796,34 @@ int debug_i=0, debug_j=0;
         break;
       }
 
-      // If time to advance the ring buffer block
-      if(next_block > curblk+1) {
-        // Mark curblk as filled
-        hpguppi_input_databuf_set_filled(db, curblk % N_INPUT_BLOCKS);
-
-        // Increment curblk
-        curblk++;
-
-        // Wait for curblk+1 to be free
-        wait_for_block_free(db, (curblk+1) % N_INPUT_BLOCKS, st, status_key);
-      } // end block advance
-
       // Count packet and bytes
       pkts_received++;
       bytes_received += curr_rpkt->length;
 
       // Update current WR with new destination addresses for all SGEs
-      base_addr = (uint64_t)hpguppi_pktbuf_block_slot_ptr(db, next_block, next_slot);
+      base_addr = (uint64_t)((uint8_t *)db->block[nxtblk].data + next_slot * slot_size);
+      sge_slot_index = num_chunks*next_slot;
       for(i=0; i<num_chunks; i++) {
         curr_rpkt->wr.sg_list[i].addr = base_addr + chunks[i].chunk_offset;
-        hibv_ctx->recv_sge_buf[num_chunks*next_slot + i].lkey = hibv_ctx->recv_mrs[next_block % db->header.n_block]->lkey;
+        hibv_ctx->recv_sge_buf[sge_slot_index + i].lkey = hibv_ctx->recv_mrs[nxtblk]->lkey;
       }
 
       // Advance slot
-      next_slot++;
-      if(next_slot >= slots_per_block) {
-        next_slot = 0;
-        next_block++;
-      }
+      next_slot = (next_slot + 1) % slots_per_block;
+      // If time to advance the ring buffer block
+      if(next_slot == 0) {
+        
+        // Mark curblk as filled
+        if(curblk >= 0)
+          hpguppi_input_databuf_set_filled(db, curblk);
+
+        // Increment nxtblk
+        curblk = nxtblk;
+        nxtblk = (nxtblk + 1) % db->header.n_block;
+
+        // Wait for nxtblk to be free
+        wait_for_block_free(db, nxtblk, st, status_key);
+      } // end block advance
     } // end for each packet
 
     // Break out of main loop if we got a work completion error
